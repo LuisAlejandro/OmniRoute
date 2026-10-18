@@ -410,9 +410,11 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
     authType: "apikey",
     authHeader: "x-goog-api-key",
     format: "gemini-ai-image",
+    // The public Gemini API serves these under their `-preview` ids (the bare ids are the
+    // Antigravity/Cloud Code names, see antigravityModelAliases.ts).
     models: [
-      { id: "gemini-3-pro-image", name: "Gemini 3 Pro Image" },
-      { id: "gemini-3.1-flash-image", name: "Gemini 3.1 Flash Image" },
+      { id: "gemini-3-pro-image-preview", name: "Gemini 3 Pro Image" },
+      { id: "gemini-3.1-flash-image-preview", name: "Gemini 3.1 Flash Image" },
     ],
     supportedSizes: ["1024x1024"],
   },

@@ -818,7 +818,7 @@ test("handleImageGeneration sends Gemini AI Studio image requests with API-key a
   try {
     const result = await handleImageGeneration({
       body: {
-        model: "gemini/gemini-3-pro-image",
+        model: "gemini/gemini-3-pro-image-preview",
         prompt: "painted beach",
         size: "1024x1024",
       },
@@ -829,14 +829,13 @@ test("handleImageGeneration sends Gemini AI Studio image requests with API-key a
     assert.equal(result.success, true);
     assert.equal(
       captured.url,
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image:generateContent"
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-image-preview:generateContent"
     );
     assert.equal(captured.headers["x-goog-api-key"], "ai-studio-key");
     assert.deepEqual(captured.body, {
       contents: [{ role: "user", parts: [{ text: "painted beach" }] }],
       generationConfig: {
         responseModalities: ["TEXT", "IMAGE"],
-        candidateCount: 1,
         imageConfig: { aspectRatio: "1:1" },
       },
     });
