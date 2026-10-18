@@ -5,16 +5,19 @@ import {
   handleVideoJobGeneration,
 } from "../../../open-sse/handlers/videoGeneration/job.ts";
 import {
-  ANON_OWNER,
+  NO_OWNER_TAG,
+  createMediaSink,
   mediaOwnerTag,
-  ownerTagForApiKey,
+  mediaOwnerTagFor,
   pruneExpiredMedia,
   readMediaFile,
   resolveMediaPath,
   writeMediaFile,
-} from "../../../open-sse/handlers/videoGeneration/mediaStore.ts";
+} from "../../../src/lib/media/mediaStore.ts";
 import { getVideoProvider } from "../../../open-sse/config/videoRegistry.ts";
-import { runWithCallLogApiKeyContext } from "../../../src/lib/usage/callLogApiKeyContext.ts";
+
+const gatewaySink = (ownerId: string | null = null) =>
+  createMediaSink({ origin: "https://gw.example/", ownerId });
 
 test("the openrouter provider is wired to the async job preset", () => {
   // OpenRouter answers POST /videos with 202 + a job id, so it must NOT use the
@@ -90,7 +93,7 @@ test("openrouter preset polls to completion and serves the auth-gated result as 
       body: { prompt: "a paper boat", duration: 5, aspect_ratio: "16:9" },
       credentials: { apiKey: "sk-test" },
       pollIntervalMs: 1,
-      mediaOrigin: "https://gw.example",
+      mediaSink: gatewaySink(),
     });
 
     assert.equal(result.success, true);
@@ -105,7 +108,7 @@ test("openrouter preset polls to completion and serves the auth-gated result as 
     assert.equal(payload[0].format, "mp4");
     assert.match(
       payload[0].url!,
-      /^https:\/\/gw\.example\/api\/v1\/media\/([a-f0-9]{16}|anon)__[a-f0-9]{32}\.mp4$/
+      /^https:\/\/gw\.example\/api\/v1\/media\/none__[a-f0-9]{32}\.mp4$/
     );
 
     // ...and the bytes are really on disk behind that URL.
@@ -132,17 +135,17 @@ test("openrouter preset polls to completion and serves the auth-gated result as 
 
 test("media ids carry a digested owner tag, never the key id itself", () => {
   const apiKeyId = "8fa9208b-27e2-4bba-a8b5-043acb003a08";
-  const tag = ownerTagForApiKey(apiKeyId);
+  const tag = mediaOwnerTagFor(apiKeyId);
 
   assert.match(tag, /^[a-f0-9]{16}$/);
   assert.equal(tag.includes("8fa9208b"), false, "must not leak the key id");
   // Stable for the same key, and different across keys — the whole basis for scoping.
-  assert.equal(ownerTagForApiKey(apiKeyId), tag);
-  assert.notEqual(ownerTagForApiKey("some-other-key"), tag);
-  // No key at all is its own bucket, not an empty tag inside the pattern.
-  assert.equal(ownerTagForApiKey(null), ANON_OWNER);
-  assert.equal(ownerTagForApiKey(undefined), ANON_OWNER);
-  assert.equal(ownerTagForApiKey("   "), ANON_OWNER);
+  assert.equal(mediaOwnerTagFor(apiKeyId), tag);
+  assert.notEqual(mediaOwnerTagFor("some-other-key"), tag);
+  // No owner at all is its own bucket, not an empty tag inside the pattern.
+  assert.equal(mediaOwnerTagFor(null), NO_OWNER_TAG);
+  assert.equal(mediaOwnerTagFor(undefined), NO_OWNER_TAG);
+  assert.equal(mediaOwnerTagFor("   "), NO_OWNER_TAG);
 
   const stored = writeMediaFile(Buffer.from("bytes"), "mp4", tag);
   assert.ok(stored, "media should be stored");
@@ -155,6 +158,7 @@ test("media ids carry a digested owner tag, never the key id itself", () => {
   for (const bad of [
     stored!.slice(stored!.indexOf("__") + 2),
     `not-a-tag__${stored!.split("__")[1]}`,
+    `anon__${stored!.split("__")[1]}`,
   ]) {
     assert.equal(mediaOwnerTag(bad), null, `should reject: ${bad}`);
     assert.equal(resolveMediaPath(bad), null, `should not resolve: ${bad}`);
@@ -163,8 +167,8 @@ test("media ids carry a digested owner tag, never the key id itself", () => {
 
 test("expired media is pruned, fresh media is kept", () => {
   const bytes = Buffer.from("prune-me");
-  const stale = writeMediaFile(bytes, "mp4", ANON_OWNER);
-  const fresh = writeMediaFile(bytes, "mp4", ANON_OWNER);
+  const stale = writeMediaFile(bytes, "mp4", NO_OWNER_TAG);
+  const fresh = writeMediaFile(bytes, "mp4", NO_OWNER_TAG);
   assert.ok(stale && fresh);
 
   // Nothing is expired yet, so a sweep at "now" removes nothing.
@@ -179,12 +183,11 @@ test("expired media is pruned, fresh media is kept", () => {
   assert.equal(resolveMediaPath(fresh!), null, "fresh file should be gone too, at that clock");
 });
 
-test("the api-key context decides the stored media owner", async () => {
-  // End-to-end for the two scoping pieces: the route binds identity via
-  // runWithCallLogApiKeyContext, and the job stores its digest in the media id so the
-  // serving route can scope by key without a lookup table.
+test("the injected media sink decides the stored media owner", async () => {
+  // The route builds the sink from the caller's owner id; the job stores its digest in the
+  // media id so the serving route can scope by key without a lookup table.
   const apiKeyId = "11111111-2222-3333-4444-555555555555";
-  const expectedTag = ownerTagForApiKey(apiKeyId);
+  const expectedTag = mediaOwnerTagFor(apiKeyId);
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (_input, init) =>
     String(init?.method ?? "GET") === "POST"
@@ -202,16 +205,14 @@ test("the api-key context decides the stored media owner", async () => {
         );
 
   try {
-    const result = await runWithCallLogApiKeyContext({ apiKeyId, apiKeyName: "main" }, () =>
-      handleVideoJobGeneration({
-        model: "alibaba/wan-3.0-owned",
-        presetName: "openrouter-video-job",
-        body: { prompt: "x" },
-        credentials: { apiKey: "sk-test" },
-        pollIntervalMs: 1,
-        mediaOrigin: "https://gw.example",
-      })
-    );
+    const result = await handleVideoJobGeneration({
+      model: "alibaba/wan-3.0-owned",
+      presetName: "openrouter-video-job",
+      body: { prompt: "x" },
+      credentials: { apiKey: "sk-test" },
+      pollIntervalMs: 1,
+      mediaSink: gatewaySink(apiKeyId),
+    });
     assert.equal(result.success, true);
 
     const url = (result.data as { data: Array<{ url: string }> }).data[0].url;
@@ -219,6 +220,82 @@ test("the api-key context decides the stored media owner", async () => {
     assert.equal(mediaOwnerTag(mediaId), expectedTag);
     // The raw key id must not appear anywhere in what the client receives.
     assert.equal(url.includes(apiKeyId), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("the provider credential is never sent to a result URL on another origin", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: string; auth: string | null }> = [];
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    const headers = new Headers(init?.headers as HeadersInit);
+    calls.push({ url, auth: headers.get("authorization") });
+    if (String(init?.method ?? "GET") === "POST") {
+      return new Response(JSON.stringify({ id: "job-x", status: "pending" }), {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.startsWith("https://evil.example")) return new Response("stolen", { status: 200 });
+    return new Response(
+      JSON.stringify({
+        id: "job-x",
+        status: "completed",
+        unsigned_urls: ["https://evil.example/collect"],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  };
+
+  try {
+    const result = await handleVideoJobGeneration({
+      model: "alibaba/wan-3.0",
+      presetName: "openrouter-video-job",
+      body: { prompt: "x" },
+      credentials: { apiKey: "sk-secret" },
+      pollIntervalMs: 1,
+      mediaSink: gatewaySink(),
+    });
+    assert.equal(result.success, false);
+    assert.equal(result.status, 502);
+    assert.equal(
+      calls.some((call) => call.url.startsWith("https://evil.example")),
+      false,
+      "the off-origin result URL must not be fetched"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("an auth-gated result without an injected media sink fails instead of leaking the upstream URL", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) =>
+    String(init?.method ?? "GET") === "POST"
+      ? new Response(JSON.stringify({ id: "job-n", status: "pending" }), {
+          status: 202,
+          headers: { "content-type": "application/json" },
+        })
+      : new Response(
+          JSON.stringify({
+            id: "job-n",
+            status: "completed",
+            unsigned_urls: ["https://openrouter.ai/api/v1/videos/job-n/content"],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        );
+  try {
+    const result = await handleVideoJobGeneration({
+      model: "alibaba/wan-3.0",
+      presetName: "openrouter-video-job",
+      body: { prompt: "x" },
+      credentials: { apiKey: "sk-test" },
+      pollIntervalMs: 1,
+    });
+    assert.equal(result.success, false);
+    assert.equal(result.status, 502);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -261,7 +338,7 @@ test("openrouter preset fails fast on a cancelled job", async () => {
       body: { prompt: "x" },
       credentials: { apiKey: "sk-test" },
       pollIntervalMs: 1,
-      mediaOrigin: "https://gw.example",
+      mediaSink: gatewaySink(),
     });
     assert.equal(result.success, false);
     assert.equal(result.status, 502);

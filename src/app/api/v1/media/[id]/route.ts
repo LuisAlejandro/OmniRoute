@@ -1,53 +1,87 @@
-import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
+import { z } from "zod";
 import { NextResponse } from "next/server";
-import { getApiKeyRequestScope } from "@/app/api/v1/_helpers/apiKeyScope";
+import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import {
-  ANON_OWNER,
+  canAccessOwnedRecord,
+  getApiKeyRequestScope,
+  resolveEffectiveApiKeyId,
+} from "@/app/api/v1/_helpers/apiKeyScope";
+import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import { buildErrorBody } from "@omniroute/open-sse/utils/error";
+import {
+  MEDIA_ID_PATTERN,
+  NO_OWNER_TAG,
   mediaMimeType,
   mediaOwnerTag,
-  ownerTagForApiKey,
+  mediaOwnerTagFor,
   readMediaFile,
-} from "@omniroute/open-sse/handlers/videoGeneration/mediaStore.ts";
+} from "@/lib/media/mediaStore";
+
+const MediaIdSchema = z.string().regex(MEDIA_ID_PATTERN);
 
 export async function OPTIONS() {
   return handleCorsOptions();
 }
 
+function notFound(): Response {
+  return NextResponse.json(buildErrorBody(404, "Media not found"), {
+    status: 404,
+    headers: CORS_HEADERS,
+  });
+}
+
 /**
- * Serve generated media stored by the video/audio job pipeline.
+ * The owner of a stored media id, in the shape `canAccessOwnedRecord()` compares: the caller's
+ * own id when the digest in the media id matches it, null for unowned media, and an opaque
+ * value that can never equal a real key id otherwise.
+ */
+function mediaRecordOwner(ownerTag: string, callerOwnerId: string | null): string | null {
+  if (ownerTag === NO_OWNER_TAG) return null;
+  if (callerOwnerId && mediaOwnerTagFor(callerOwnerId) === ownerTag) return callerOwnerId;
+  return `media-owner:${ownerTag}`;
+}
+
+/**
+ * Serve generated media stored by the video job pipeline (#16372) — provider results that are
+ * auth-gated upstream (OpenRouter's `/videos/{id}/content`) are handed back as a URL here.
  *
- * Exists so provider results that are auth-gated upstream (OpenRouter's
- * `/videos/{id}/content`) can be handed back as a URL on this gateway. Without
- * it the caller receives either an unfetchable upstream URL or a base64 blob,
- * and the response shape would vary by provider — breaking combo failover, where
- * only some targets can be serialized as a plain URL.
- *
- * The id is validated against the exact pattern mediaStore generates, so an id
- * taken from the URL cannot escape the media directory.
- *
- * Media is scoped to the key that generated it, mirroring the files API. The owner
- * is carried in the id as a digest rather than looked up in a table: media ids are
- * stateless by design, so there is nothing to query. A mismatch returns 404 rather
- * than 403 so the route does not confirm that an unowned id exists.
+ * Ownership follows the files API exactly (`canAccessOwnedRecord`): the key that generated the
+ * media (or a manage-scope key / the dashboard session) can read it; anonymous media under
+ * REQUIRE_API_KEY=false is shared by anonymous callers only; unowned (session) media needs the
+ * session. A mismatch answers 404 so the route never confirms that an unowned id exists. The id
+ * is validated against the exact pattern the store generates, so it cannot escape the media dir.
  */
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const scope = await getApiKeyRequestScope(request);
   if (scope.rejection) return scope.rejection;
-
-  const { id } = await params;
-  const ownerTag = mediaOwnerTag(id);
-  const owned =
-    ownerTag === ANON_OWNER ||
-    scope.isSessionAuth ||
-    ownerTag === ownerTagForApiKey(scope.apiKeyId);
-
-  const content = owned ? readMediaFile(id) : null;
-  if (!content) {
-    return NextResponse.json(
-      { error: { message: "Media not found", type: "invalid_request_error" } },
-      { status: 404, headers: CORS_HEADERS }
-    );
+  if (scope.apiKey && !scope.apiKeyId) {
+    return NextResponse.json(buildErrorBody(401, "Invalid API key"), {
+      status: 401,
+      headers: CORS_HEADERS,
+    });
   }
+
+  const policy = await enforceApiKeyPolicy(request, null);
+  if (policy.rejection) return policy.rejection;
+
+  const parsed = MediaIdSchema.safeParse((await params).id);
+  if (!parsed.success) return notFound();
+  const id = parsed.data;
+
+  const ownerTag = mediaOwnerTag(id);
+  const callerOwnerId = resolveEffectiveApiKeyId(scope, policy.apiKeyInfo);
+  if (
+    !ownerTag ||
+    !canAccessOwnedRecord(
+      { ...scope, apiKeyId: callerOwnerId },
+      mediaRecordOwner(ownerTag, callerOwnerId)
+    )
+  ) {
+    return notFound();
+  }
+
+  const content = readMediaFile(id);
+  if (!content) return notFound();
 
   return new Response(new Uint8Array(content), {
     headers: {

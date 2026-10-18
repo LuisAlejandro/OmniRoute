@@ -26,22 +26,22 @@ const DATA_DIR = resolveDataDir({ isCloud });
 export const MEDIA_DIR = isCloud || isBuildPhase ? null : path.join(DATA_DIR, "media");
 
 /**
- * Owner tag standing in for "no attributable key". Serving treats it as readable by
- * any authenticated caller, which matches how such a row is reported elsewhere
- * (`usageStats` buckets unattributed traffic the same way).
+ * Owner tag for media written with no owner key (a dashboard-session request with no API key).
+ * Mirrors `canAccessOwnedRecord()`: an unowned record is readable only by the dashboard
+ * session or a manage-scope key, never by an arbitrary authenticated key.
  */
-export const ANON_OWNER = "anon";
+export const NO_OWNER_TAG = "none";
 
 /**
- * Ids are `<ownerTag>__<uuid>.<ext>`. The owner tag is a truncated digest of the
- * requesting API key id rather than the id itself, so a served URL does not leak
- * which key produced it, and no side table is needed to answer "who owns this?".
+ * Ids are `<ownerTag>__<uuid>.<ext>`. The owner tag is a truncated digest of the owning id
+ * (an API key id, or the shared anonymous-caller sentinel under REQUIRE_API_KEY=false) rather
+ * than the id itself, so a served URL does not leak which key produced it and no side table is
+ * needed to answer "who owns this?".
  *
- * Both parts must match exactly, which also keeps `../` and absolute paths out of
- * the serving route — that route takes its id straight from the URL, and the only
- * reason it cannot escape MEDIA_DIR is this pattern.
+ * Both parts must match exactly, which also keeps `../` and absolute paths out of the serving
+ * route — that route takes its id straight from the URL.
  */
-const MEDIA_ID_PATTERN = /^([a-f0-9]{16}|anon)__[a-f0-9]{32}\.[a-z0-9]{2,5}$/;
+export const MEDIA_ID_PATTERN = /^([a-f0-9]{16}|none)__[a-f0-9]{32}\.[a-z0-9]{2,5}$/;
 
 /** Extensions we will store, mapped to the mime type the serving route reports. */
 const MIME_TYPES: Record<string, string> = {
@@ -93,17 +93,17 @@ export function writeMediaFile(
 }
 
 /**
- * Digested owner tag for an API key id, or ANON_OWNER when there is none.
- * Callers pass the raw key id; only the digest is ever stored or served.
+ * Digested owner tag for an owning id (API key id or the anonymous-owner sentinel), or
+ * NO_OWNER_TAG when there is none. Only the digest is ever stored or served.
  */
-export function ownerTagForApiKey(apiKeyId: string | null | undefined): string {
-  const raw = typeof apiKeyId === "string" ? apiKeyId.trim() : "";
-  if (!raw) return ANON_OWNER;
+export function mediaOwnerTagFor(ownerId: string | null | undefined): string {
+  const raw = typeof ownerId === "string" ? ownerId.trim() : "";
+  if (!raw) return NO_OWNER_TAG;
   return createHash("sha256").update(raw).digest("hex").slice(0, 16);
 }
 
 function normalizeOwnerTag(ownerTag: string | null): string {
-  return ownerTag && /^[a-f0-9]{16}$/.test(ownerTag) ? ownerTag : ANON_OWNER;
+  return ownerTag && /^[a-f0-9]{16}$/.test(ownerTag) ? ownerTag : NO_OWNER_TAG;
 }
 
 /** Owner tag embedded in a stored media id, or null when the id is not one of ours. */
@@ -177,4 +177,22 @@ export function readMediaFile(id: string): Buffer | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Media sink injected into the open-sse video job pipeline by the route (the job module never
+ * imports src/): stores the bytes under the request owner and returns the URL to hand back,
+ * or null when no writable media directory exists.
+ */
+export function createMediaSink({ origin, ownerId }: { origin: string; ownerId: string | null }): {
+  store: (bytes: Buffer, format: string) => string | null;
+} {
+  const base = origin.replace(/\/+$/, "");
+  const ownerTag = mediaOwnerTagFor(ownerId);
+  return {
+    store(bytes, format) {
+      const id = writeMediaFile(bytes, format, ownerTag);
+      return id ? `${base}/api/v1/media/${id}` : null;
+    },
+  };
 }
