@@ -24,7 +24,7 @@ export interface GeminiAiImageDeps {
     startTime: number;
     error: unknown;
     requestBody?: unknown;
-  }) => { success: false; status: number; error: unknown };
+  }) => { success: boolean; status: number; error: unknown };
   sanitizeProviderError: (errorText: string) => unknown;
   fetchWithTimeout: (url: string, init: RequestInit & { timeoutMs?: number }) => Promise<Response>;
   isTimeoutError: (err: unknown) => boolean;
@@ -43,8 +43,14 @@ interface GeminiAiImageArgs {
 }
 
 type GeminiAiImage = { b64_json: string; revised_prompt?: string };
-type GeminiAiCallResult =
-  { ok: true; images: GeminiAiImage[] } | { ok: false; status: number; error: unknown };
+// Structural rather than a discriminated union: open-sse compiles with `strict: false`, where
+// a `true`/`false` literal widens to boolean and cannot narrow a union.
+type GeminiAiCallResult = {
+  ok: boolean;
+  images?: GeminiAiImage[];
+  status?: number;
+  error?: unknown;
+};
 
 const PROVIDER = "gemini";
 
@@ -161,16 +167,16 @@ export async function handleGeminiAiImageGeneration({
       requestOneImage(url, apiKey, requestBody, promptText, signal, deps)
     )
   );
-  const images = results.flatMap((result) => (result.ok ? result.images : []));
+  const images = results.flatMap((result) => (result.ok ? (result.images ?? []) : []));
 
   if (images.length === 0) {
     const failure = results.find((result) => !result.ok);
     return deps.saveErrorResult({
       provider: PROVIDER,
       model,
-      status: failure && !failure.ok ? failure.status : 502,
+      status: failure?.status ?? 502,
       startTime,
-      error: failure && !failure.ok ? failure.error : "Gemini AI Studio returned no image data",
+      error: failure?.error ?? "Gemini AI Studio returned no image data",
       requestBody: logRequestBody,
     });
   }
