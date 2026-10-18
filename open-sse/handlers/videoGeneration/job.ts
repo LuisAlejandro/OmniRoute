@@ -16,7 +16,12 @@ import {
 } from "@/shared/utils/fetchTimeout";
 import { sanitizeErrorMessage } from "../../utils/error.ts";
 import { sleep } from "../../utils/sleep.ts";
-import { saveCallLog, saveRequestUsage } from "@/lib/usageDb";
+import {
+  MAX_CONSECUTIVE_POLL_RETRIES,
+  computePollRetryDelayMs,
+  isRetryablePollStatus,
+  parseRetryAfterMs,
+} from "./pollRetry.ts";
 
 interface LogLike {
   info?: (tag: string, msg: string, meta?: unknown) => void;
@@ -233,10 +238,6 @@ export function getVideoJobPreset(presetName: unknown): VideoJobPreset | null {
   return preset ?? null;
 }
 
-/**
- * Handle a video-generation job via the submit→poll preset pipeline.
- * Returns the same shape as the sync handlers: { success, data?: …, status?, error? }.
- */
 type JobLog = {
   info?: (tag: string, msg: string, meta?: unknown) => void;
   error?: (tag: string, msg: string) => void;
@@ -245,21 +246,8 @@ type JobLog = {
 export type VideoJobResult =
   { success: true; data: unknown } | { success: false; status: number; error: string };
 
-/**
- * Record a finished job in both usage surfaces.
- *
- * This pipeline previously wrote neither, so a job-preset provider was invisible in
- * the request log and in the usage view while the synchronous video handlers appeared
- * in both. `path`/`duration` are the names the call-log writer reads, and `endpoint` is
- * what the usage row reports; the synchronous OpenAI path had been passing
- * `endpoint`/`durationMs`, which were silently dropped.
- */
-async function recordJobCall({
-  provider,
-  model,
-  result,
-  durationMs,
-}: {
+/** One finished job, as handed to the injected call recorder. */
+export interface VideoJobCallRecord {
   provider: string;
   model: string;
   /**
@@ -270,30 +258,14 @@ async function recordJobCall({
    */
   result: { success: boolean; status?: number; error?: string };
   durationMs: number;
-}): Promise<void> {
-  const status = result.success ? 200 : (result.status ?? 502);
-  const error = result.success ? undefined : result.error;
-  await Promise.allSettled([
-    saveCallLog({
-      method: "POST",
-      path: "/v1/videos/generations",
-      status,
-      model: `${provider}/${model}`,
-      provider,
-      duration: durationMs,
-      ...(error ? { error } : {}),
-    }),
-    saveRequestUsage({
-      provider,
-      model,
-      endpoint: "video",
-      status: String(status),
-      success: result.success,
-      latencyMs: durationMs,
-      ...(error ? { errorCode: error.slice(0, 200) } : {}),
-    }),
-  ]);
 }
+
+/**
+ * Persists a finished job (call log + usage row). Injected by the dispatcher in
+ * `../videoGeneration.ts`, which owns the usage-DB writers, so this module keeps no
+ * dependency on the app's `@/lib` layer.
+ */
+export type RecordVideoJobCall = (record: VideoJobCallRecord) => Promise<void> | void;
 
 /**
  * Handle a video-generation job via the submit→poll preset pipeline.
@@ -308,6 +280,7 @@ export async function handleVideoJobGeneration({
   maxPolls,
   pollIntervalMs,
   provider,
+  recordCall,
 }: {
   model: string;
   presetName: string;
@@ -318,6 +291,8 @@ export async function handleVideoJobGeneration({
   pollIntervalMs?: number;
   /** Provider id, for the usage/call-log rows. Unknown falls back to the preset. */
   provider?: string;
+  /** Usage/call-log recorder; when absent the job is not recorded. */
+  recordCall?: RecordVideoJobCall;
 }): Promise<VideoJobResult> {
   const startTime = Date.now();
   const result = await runVideoJobGeneration({
@@ -330,12 +305,19 @@ export async function handleVideoJobGeneration({
     pollIntervalMs,
   });
   // Recorded here rather than on each return, so a new exit path cannot skip it.
-  await recordJobCall({
-    provider: provider || presetName,
-    model,
-    result,
-    durationMs: Date.now() - startTime,
-  });
+  // A recording failure must never turn a finished generation into an error.
+  if (recordCall) {
+    try {
+      await recordCall({
+        provider: provider || presetName,
+        model,
+        result,
+        durationMs: Date.now() - startTime,
+      });
+    } catch (error) {
+      log?.error?.("VIDEO", `Failed to record video job call: ${sanitizeErrorMessage(error)}`);
+    }
+  }
   return result;
 }
 
@@ -419,8 +401,11 @@ async function runVideoJobGeneration({
   const maxPolls = maxPollsOverride ?? preset.maxPolls;
   const pollInterval = pollIntervalOverride ?? preset.pollIntervalMs;
 
+  let consecutiveRetries = 0;
+  let nextDelay = pollInterval;
   for (let attempt = 1; attempt <= maxPolls; attempt += 1) {
-    await sleep(pollInterval);
+    await sleep(nextDelay);
+    nextDelay = pollInterval;
     const pollUrl = `${baseUrl}${preset.poll.pathTemplate
       .replace("{taskId}", encodeURIComponent(taskId))
       .replace("{model}", encodeURIComponent(model))}`;
@@ -430,8 +415,23 @@ async function runVideoJobGeneration({
       log,
     });
     if (pollResult.ok === false) {
+      // #15536: 429/503 on a status query is transient - back off and keep polling.
+      if (
+        isRetryablePollStatus(pollResult.status) &&
+        consecutiveRetries < MAX_CONSECUTIVE_POLL_RETRIES
+      ) {
+        consecutiveRetries += 1;
+        nextDelay = computePollRetryDelayMs(
+          pollInterval,
+          consecutiveRetries,
+          pollResult.retryAfterMs
+        );
+        attempt -= 1; // transient waits do not consume the poll budget
+        continue;
+      }
       return { success: false, status: pollResult.status, error: pollResult.error };
     }
+    consecutiveRetries = 0;
 
     const status =
       readPath(pollResult.data, preset.statusPath) ??
@@ -523,7 +523,9 @@ async function fetchJson(
     body?: string;
     log?: LogLike;
   }
-): Promise<{ ok: true; data: unknown } | { ok: false; status: number; error: string }> {
+): Promise<
+  { ok: true; data: unknown } | { ok: false; status: number; error: string; retryAfterMs?: number }
+> {
   try {
     const response = await fetchWithTimeout(url, {
       method,
@@ -534,7 +536,12 @@ async function fetchJson(
     if (!response.ok) {
       const errorText = await response.text();
       log?.error?.("VIDEO", `Upstream ${response.status} for ${url}: ${errorText.slice(0, 200)}`);
-      return { ok: false, status: response.status, error: errorText };
+      return {
+        ok: false,
+        status: response.status,
+        error: errorText,
+        retryAfterMs: parseRetryAfterMs(response.headers.get("retry-after")),
+      };
     }
     const data = await response.json();
     return { ok: true, data };

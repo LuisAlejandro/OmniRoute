@@ -2,6 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { handleVideoJobGeneration } from "../../../open-sse/handlers/videoGeneration/job.ts";
+import {
+  handleVideoGeneration,
+  recordVideoJobCall,
+} from "../../../open-sse/handlers/videoGeneration.ts";
 import { SQLITE_FILE } from "../../../src/lib/db/core.ts";
 import { runWithCallLogApiKeyContext } from "../../../src/lib/usage/callLogApiKeyContext.ts";
 
@@ -55,6 +59,7 @@ test("a completed job-preset generation is recorded in call_logs AND usage_histo
       body: { prompt: "a paper boat", duration: 5 },
       credentials: { apiKey: "sk-test" },
       provider: "muapi",
+      recordCall: recordVideoJobCall,
       pollIntervalMs: 1,
     });
     assert.equal(result.success, true);
@@ -90,6 +95,7 @@ test("a failed job is recorded too, so errors are visible", async () => {
       body: { prompt: "x" },
       credentials: { apiKey: "sk-test" },
       provider: "muapi",
+      recordCall: recordVideoJobCall,
       pollIntervalMs: 1,
     });
     assert.equal(result.success, false);
@@ -125,6 +131,7 @@ test("the request-scoped api-key context attributes both rows", async () => {
         body: { prompt: "x" },
         credentials: { apiKey: "sk-test" },
         provider: "muapi",
+        recordCall: recordVideoJobCall,
         pollIntervalMs: 1,
       })
     );
@@ -140,5 +147,43 @@ test("the request-scoped api-key context attributes both rows", async () => {
     assert.equal(usage[0].api_key_name, "main");
   } finally {
     restore();
+  }
+});
+
+test("the video dispatcher wires the recorder into a built-in job-preset provider", async () => {
+  // Goes through the public dispatcher (agnes = built-in `agnes-video-job` preset) so
+  // the injection itself is covered, not just the recorder: a dispatcher that stops
+  // passing `recordCall` would silently drop both rows again.
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) =>
+    String(init?.method ?? "GET") === "POST"
+      ? new Response(JSON.stringify({ video_id: "agnes-job-1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        })
+      : new Response(
+          JSON.stringify({ status: "completed", metadata: { url: "https://cdn.example/a.mp4" } }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        );
+
+  try {
+    const result = await handleVideoGeneration({
+      body: { model: "agnes/agnes-video-v2.0", prompt: "a lighthouse", poll_interval_ms: 1 },
+      credentials: { apiKey: "sk-test" },
+      log: null,
+    });
+    assert.equal(result.success, true);
+
+    const calls = rowsFor("call_logs", "agnes/agnes-video-v2.0");
+    assert.equal(calls.length, 1, "expected exactly one call_logs row");
+    assert.equal(calls[0].provider, "agnes");
+    assert.equal(calls[0].path, "/v1/videos/generations");
+
+    const usage = rowsFor("usage_history", "agnes-video-v2.0");
+    assert.equal(usage.length, 1, "expected exactly one usage_history row");
+    assert.equal(usage[0].provider, "agnes");
+    assert.equal(usage[0].endpoint, "video");
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
